@@ -35,6 +35,7 @@ from tools.skill_manager_guards import (
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
+from tools.file_operations_common import _detect_line_ending, _normalize_line_endings
 
 logger = logging.getLogger(__name__)
 
@@ -440,23 +441,52 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
     return (None, guard) if guard else (skill_dir, None)
 
 
+def _target_line_ending(target: Path) -> Optional[str]:
+    """Line ending to write ``target`` with, or None when it has no previous style.
+
+    ``atomic_write_text`` writes text-mode; with the platform default (``newline=None``)
+    Windows translates every ``\\n`` to ``\\r\\n``, so patching one line rewrote a whole LF
+    file as CRLF — a dirty git worktree on Windows, and (through ``core.autocrlf``) the
+    "changed one line, got a whole-file diff" confusion. Writers here therefore normalize
+    content to this ending and pass ``newline=""``, so the same bytes land on Windows and
+    on Linux CI. None (new file) means "no style to preserve": the caller's own bytes are
+    written as-is — models emit LF, so new skills are LF, while an explicitly CRLF payload
+    (a Windows ``scripts/*.bat``) is still honored.
+    """
+    if not target.exists():
+        return None
+    try:
+        sample = target.read_bytes()[:4096]
+    except OSError:
+        return None
+    return _detect_line_ending(sample.decode("utf-8", "surrogateescape"))
+
+
+def _write_skill_text(target: Path, content: str, ending: Optional[str], **write_kwargs: Any) -> None:
+    """Write skill content atomically with *ending* line endings, byte-exact everywhere."""
+    if ending is not None:
+        content = _normalize_line_endings(content, ending)
+    atomic_write_text(target, content, newline="", **write_kwargs)
+
+
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
                    content: str) -> Optional[Dict[str, Any]]:
     """Read-before-write guard (existing targets only), atomic write, then the security scan;
     a blocked scan restores the original (or unlinks a new file). Error dict or None."""
     original = None
+    ending = _target_line_ending(target)
     if target.exists():
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8-sig")
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
-    atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
+    _write_skill_text(target, content, ending, preserve_mode=True, create_mode=0o644)
     scan_error = _security_scan_skill(skill_dir)
     if not scan_error:
         return None
     if original is not None:
-        atomic_write_text(target, original, preserve_mode=True)
+        _write_skill_text(target, original, ending, preserve_mode=True)
     else:
         target.unlink(missing_ok=True)
     return _err(scan_error)

@@ -1442,3 +1442,127 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+# ---------------------------------------------------------------------------
+# Line-ending preservation
+# ---------------------------------------------------------------------------
+
+LF_SKILL_BODY = VALID_SKILL_CONTENT.encode("utf-8")
+CRLF_SKILL_BODY = VALID_SKILL_CONTENT.replace("\n", "\r\n").encode("utf-8")
+
+
+def _write_skill_bytes(tmp_path, raw: bytes, name: str = "test-skill") -> Path:
+    """Lay down a skill directory whose SKILL.md has exactly *raw* bytes."""
+    skill_dir = tmp_path / name
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_bytes(raw)
+    return skill_md
+
+
+def _assert_only_endings(raw: bytes, ending: bytes) -> None:
+    """Every newline in *raw* is *ending* — no LF left over in a CRLF file."""
+    assert raw.count(b"\n") == raw.count(ending), raw
+
+
+class TestLineEndingPreservation:
+    """skill_manage must never rewrite a file's line endings.
+
+    Writers went through ``atomic_write_text`` in text mode with the platform default
+    (``newline=None``), so on Windows every ``\\n`` became ``\\r\\n``: patching one line
+    rewrote the whole file as CRLF — a dirty git worktree, and (through
+    ``core.autocrlf=input``) the "changed 1 line, got a whole-file diff" confusion.
+    Content is now normalized to the target's own ending and written with ``newline=""``,
+    so the bytes are identical on Windows and on Linux CI.
+    """
+
+    def test_patch_leaves_lf_file_lf(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_md = _write_skill_bytes(tmp_path, LF_SKILL_BODY)
+            result = _patch_skill("test-skill", "Do the thing.", "Do the new thing.")
+        assert result["success"] is True, result.get("error")
+        raw = skill_md.read_bytes()
+        assert b"Do the new thing." in raw
+        assert b"\r\n" not in raw
+
+    def test_patch_leaves_crlf_file_crlf(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_md = _write_skill_bytes(tmp_path, CRLF_SKILL_BODY)
+            result = _patch_skill("test-skill", "Do the thing.", "Do the new thing.")
+        assert result["success"] is True, result.get("error")
+        raw = skill_md.read_bytes()
+        assert b"Do the new thing." in raw
+        _assert_only_endings(raw, b"\r\n")
+
+    def test_patch_multiline_new_string_keeps_crlf_file_consistent(self, tmp_path):
+        """A bare-LF multi-line replacement must not leave mixed endings behind."""
+        with _skill_dir(tmp_path):
+            skill_md = _write_skill_bytes(tmp_path, CRLF_SKILL_BODY)
+            result = _patch_skill(
+                "test-skill", "# Test Skill\n", "# Test Skill\n\nNew line one.\nNew line two.\n")
+        assert result["success"] is True, result.get("error")
+        raw = skill_md.read_bytes()
+        assert b"New line two." in raw
+        _assert_only_endings(raw, b"\r\n")
+
+    def test_edit_leaves_lf_file_lf(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_md = _write_skill_bytes(tmp_path, LF_SKILL_BODY)
+            result = _edit_skill("test-skill", VALID_SKILL_CONTENT_2)
+        assert result["success"] is True, result.get("error")
+        raw = skill_md.read_bytes()
+        assert b"Updated description" in raw
+        assert b"\r\n" not in raw
+
+    def test_edit_leaves_crlf_file_crlf(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_md = _write_skill_bytes(tmp_path, CRLF_SKILL_BODY)
+            result = _edit_skill("test-skill", VALID_SKILL_CONTENT_2)
+        assert result["success"] is True, result.get("error")
+        raw = skill_md.read_bytes()
+        assert b"Updated description" in raw
+        _assert_only_endings(raw, b"\r\n")
+
+    def test_created_skill_md_is_lf(self, tmp_path):
+        """New skills are LF on every platform (never CRLF-wrapped on Windows)."""
+        with _skill_dir(tmp_path):
+            result = _create_skill("test-skill", VALID_SKILL_CONTENT)
+        assert result["success"] is True, result.get("error")
+        raw = (tmp_path / "test-skill" / "SKILL.md").read_bytes()
+        assert b"Step 1: Do the thing." in raw
+        assert b"\r\n" not in raw
+
+    def test_new_supporting_file_is_lf(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("test-skill", VALID_SKILL_CONTENT)
+            result = _write_file("test-skill", "references/notes.md", "first\nsecond\n")
+        assert result["success"] is True, result.get("error")
+        raw = (tmp_path / "test-skill" / "references" / "notes.md").read_bytes()
+        assert raw == b"first\nsecond\n"
+
+    def test_new_file_keeps_an_explicit_crlf_payload(self, tmp_path):
+        """A brand-new file has no style to preserve: the caller's bytes win.
+
+        Without this, a CRLF payload (a Windows ``scripts/*.bat``) would be silently
+        rewritten to LF on Linux and mangled by translation on Windows.
+        """
+        with _skill_dir(tmp_path):
+            _create_skill("test-skill", VALID_SKILL_CONTENT)
+            result = _write_file("test-skill", "scripts/run.bat", "@echo off\r\nrem hi\r\n")
+        assert result["success"] is True, result.get("error")
+        raw = (tmp_path / "test-skill" / "scripts" / "run.bat").read_bytes()
+        assert raw == b"@echo off\r\nrem hi\r\n"
+
+    def test_supporting_file_overwrite_keeps_crlf(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("test-skill", VALID_SKILL_CONTENT)
+            refs = tmp_path / "test-skill" / "references"
+            refs.mkdir()
+            target = refs / "notes.md"
+            target.write_bytes(b"first\r\nsecond\r\n")
+            result = _write_file("test-skill", "references/notes.md", "first\nsecond\nthird\n")
+        assert result["success"] is True, result.get("error")
+        raw = target.read_bytes()
+        assert b"third" in raw
+        _assert_only_endings(raw, b"\r\n")
