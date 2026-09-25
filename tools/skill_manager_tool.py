@@ -117,9 +117,11 @@ MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-friendly
 # Existing (on-disk) skills may carry uppercase or a leading underscore — the name the agent was
 # shown is whatever skills_list()/skill_view() report, and a name this tool refuses is a skill it
-# cannot maintain. Only the SHAPE is guarded here; _find_skill decides existence. A name with a
-# space or a slash (frontmatter-only spellings like ``Word / DOCX``) stays out of reach — pass the
-# directory name, which every skill has.
+# cannot maintain. Only the SHAPE is guarded here; _find_skill decides existence. The space in the
+# character class is deliberate: a directory named ``my skill`` is resolvable by exact match, so
+# spaces must pass shape and fail (if unresolvable) at the lookup with "not found". Frontmatter-only
+# spellings like ``Word / DOCX`` are still rejected HERE — pathlib keeps the space after the slash
+# (Path("Word / DOCX").name == " DOCX") and the leading space fails the first-character class.
 VALID_EXISTING_NAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._ -]*$')
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
 _FRONTMATTER_END_RE = re.compile(r'\n---\s*\n')
@@ -267,7 +269,8 @@ def _skill_frontmatter_name(skill_md: Path) -> Optional[str]:
         return None
     if name := _name_of(head):
         return name
-    try:  # window held no closed frontmatter fence (very long block) — read the whole file
+    try:  # window held no closed frontmatter fence — a correctness fallback for non-conformant
+        # or oversized (~100 KB) frontmatter blocks, never the performance path.
         return _name_of(skill_md.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         return None
