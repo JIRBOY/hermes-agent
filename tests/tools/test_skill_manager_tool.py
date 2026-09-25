@@ -1,5 +1,6 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
+import hashlib
 import json
 import os
 import sys
